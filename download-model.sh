@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# ./download-model.sh nvidia/GLM-5.2-NVFP4
+MODEL_TAG=$1
+
+HOST_1=192.168.100.11
+HOST_2=192.168.100.12
+HOST_3=192.168.100.13
+HOST_4=192.168.100.14
+HOST_5=192.168.100.15
+HOST_6=192.168.100.16
+HOST_7=192.168.100.17
+HOST_8=192.168.100.18
+
+BASE_PATH="$HOME/code/spark-vllm-docker"
+HF_HUB_DISABLE_XET="1"
+HF_DISABLE_XET="1"
+
+"$BASE_PATH/hf-download.sh" $MODEL_TAG \
+    -c $HOST_1,$HOST_2,$HOST_3,$HOST_4,$HOST_5,$HOST_6,$HOST_7,$HOST_8 \
+    --copy-parallel
