@@ -1,0 +1,212 @@
+# Recipe: MiniMax-M3-NVFP4
+# nvidia/MiniMax-M3-NVFP4: MiniMaxM3SparseForConditionalGeneration — a
+# multimodal (vision) MoE, 60 layers / 128 experts / 64 heads, NVFP4
+# (modelopt) quant. ~233GiB -> ~29GiB/node on 8 Sparks at TP=8, leaving
+# huge KV headroom. Native context 1,048,576 (start lower, expand later).
+#
+# Unlike GLM-5.2/Kimi this model is NOT MLA/DSA — it uses lightning/linear
+# attention. So the sparse-MLA workarounds do NOT apply here: no
+# mods/glm-5.2, no block-size 64, no 64-token chunk cap, no persistent_topk
+# context ceiling. This is a comparatively "normal" bring-up.
+#
+# Sampling: --generation-config auto honors the model's generation_config
+# (temperature 1.0, top_p 0.95). This is REQUIRED — clients that send no
+# sampling params (e.g. pi) otherwise run at top_p=1.0 and long contexts
+# collapse into runaway repetition. (Learned the hard way on Kimi.)
+#
+# STILL A DEAD END ON vLLM/sm_121 (re-verified 2026-07-12 on dev1043,
+# which includes the #47502 MSA rework + eugr preset #47392). The blocker
+# is the MoE layer, not attention — all NVFP4 MoE backends fail on the
+# M3 config (SWIGLUOAI_UNINTERLEAVE activation, 128 experts) on GB10:
+# - FLASHINFER_CUTLASS: clean refusal at startup ("kernel does not
+#   support MoEActivation.SWIGLUOAI_UNINTERLEAVE")
+# - MARLIN (auto pick): loads and serves, but output is fluent garbage
+#   even on a 5-token raw /v1/completions probe (sparse attention barely
+#   engaged at that length => MoE activation numerics are the culprit;
+#   same failure class as the 07-05 attempt, so the #47502 KV-layout
+#   rework did not fix it)
+# - FLASHINFER_B12X: passes validation, then CUDA illegal memory access
+#   during warmup, engine dead
+# - FLASHINFER_TRTLLM: not eligible on sm_121
+# Attention side is fine (Triton indexer selected, loads clean).
+#
+# ROOT CAUSE CONFIRMED + COMMUNITY FIX EXISTS (2026-07-15, NVIDIA forum
+# 376979, user baristankut, 4x Spark, vLLM nightly): the NVFP4-Marlin MoE
+# path DROPS the SwiGLU-OAI activation params (gemm1_alpha/gemm1_beta
+# never reach the kernel) -> the fluent garbage we saw. Fix = thread the
+# params through 3 files (config.py, oracle/nvfp4.py, modelopt.py) —
+# unreported upstream as of 07-15 (adjacent: issue #45859, PR #42601
+# marlin clamp). Their working config: TP=4, TRITON_ATTN, EAGLE3 spec
+# decode x2 (lossless), NVFP4-packed KV -> 1.17M-token pool, ~31 tok/s.
+# REVIVAL IN PROGRESS (2026-07-18): mods/minimax-m3-swigluoai written and
+# dry-run-verified against dev1043 (5 exact-string patches threading
+# gemm1_alpha/gemm1_beta through modelopt.py -> oracle/nvfp4.py ->
+# fused_moe/config.py, mirroring quark_moe.py's pattern). Target: TP=4 on
+# the utility quartet (spark-09..12, physical ring topology). Still TODO:
+# re-download weights (evicted 07-15), 4-node ring networking, first
+# light. Consider afterward: NVFP4-packed KV (1.17M pool) + EAGLE3 x2.
+# ALTERNATIVE: SGLang (scitrera/dgx-spark-sglang-mm:v0, forum 373177).
+#
+# FIRST LIGHT PASSED on TCP ring (2026-07-19): mod validated end-to-end,
+# chat canary exact, but decode only 4.43 tok/s (TCP latency floor) and
+# vision crashed the engine (cublasSgemm CUBLAS_STATUS_EXECUTION_FAILED
+# -> IMA on first image). VISION RESOLVED 2026-07-22: on the RDMA/switch
+# relaunch of the SAME image (dev1237) vision works — verified with real
+# user images plus 64x64 and 1024x768 probes, zero cublas errors. The
+# 07-19 crash was environment-tied to the TCP-ring config (transport /
+# ring env / launch mode); exact root cause never established.
+#
+# SWITCH DAY (2026-07-22): quartet re-cabled to the 100G QSFP switch,
+# flat 192.168.100.21-24/24, jumbo mesh + both RoCE rails verified on all
+# 4 nodes. TCP-ring env replaced with fleet-standard RDMA pins below;
+# .env expanded to the quartet with dual-rail IB_IF. Baseline without
+# spec decode: 27.3 tok/s single-stream decode, TTFT ~0.3 s.
+#
+# EAGLE3 (2026-07-22): Inferact/MiniMax-M3-EAGLE3 draft (1-layer dense
+# llama head, 6.5 GB bf16, 1M ctx, ~57% dialogue / ~83% math-code
+# acceptance per card). num_speculative_tokens=2 + TRITON_ATTN is the
+# baristankut-proven combo on 4x Spark (card suggests 3 + FLASH_ATTN on
+# other hardware; FLASH_ATTN full-attn is not usable on sm_121). Spec
+# decode is lossless (rejection sampling) — canary must stay exact.
+# Measured: 27.3 -> ~34 tok/s single-stream (66% token acceptance,
+# 1.32 accepted/draft). KV pool 710,784 -> 601,984 (draft layer's slice).
+#
+# 1M CONTEXT via FP8 KV (2026-07-22, late): --kv-cache-dtype fp8 halves
+# per-token KV -> 34.5GiB pool = 1,087,872 tokens >= native 1,048,576.
+# Notes from the bring-up:
+# - "nvfp4" KV (forum 376979's label) is REJECTED by TRITON_ATTN on
+#   dev1237 ("kv_cache_dtype not supported"); the forum's pool-size
+#   arithmetic (1.17M tok / 28GiB) matches FP8 density, not FP4 — their
+#   working config was almost certainly effectively 8-bit KV.
+# - fp8 KV is NOT bit-lossless, but M3's lightning-indexer side cache
+#   stays bf16 (indexer_kv_dtype) — block selection is unquantized;
+#   fp8 touches only K/V within selected blocks. Uncalibrated scales
+#   (vLLM default 1.0) — watch for subtle long-gen quality drift.
+# - Validation: canary 5461 exact; needle 3/3 verbatim at 112k, 536k,
+#   and 1,004,147 tokens; prefill ~1.0-1.4k tok/s at depth.
+# - bf16/256k fallback if quality ever drifts: drop --kv-cache-dtype,
+#   kv bytes 32212254720, max_model_len 262144, gpu-mem-util 0.85.
+#
+# EAGLE3 ADOPTED (2026-07-22, after the layout fix): its earlier
+# "crashes" — including the serial-with-async one — were the topk
+# buffer layout bug (spec decode's decode_query_len=3 inflates nd and
+# reshapes batches, hitting the NULL-slice path sooner). Re-validated
+# on top of mods/minimax-m3-topk-buffer-layout WITH async scheduling
+# on: 35/35 serial, 20/20 scenario matrix, 8-min 4-way barrage 95/95,
+# canary 5461 exact (lossless), no reasoning leaks. Single-stream
+# ~32-34 tok/s e2e (+~25% vs 27.3 baseline); acceptance 55-66%
+# depending on workload (higher on dialogue/math, lower on random-word
+# soak prompts). Draft: Inferact/MiniMax-M3-EAGLE3 (6.5 GB, staged on
+# all 4 nodes); KV pool with drafter: 601,984 tokens.
+# Next candidate after this: NVFP4-packed KV (--kv-cache-dtype nvfp4,
+# 1.17M-token pool per forum 376979) — NOT bundled here to isolate
+# regressions; KV quantization is NOT lossless.
+#
+# Known-lurking bugs to watch on first light (mitigations staged, not
+# pre-applied):
+# - vLLM #46253: cross-node CUDA-graph capture can fault on GB10 (no
+#   GPUDirect). If capture dies at capture_end, add --enforce-eager (costs
+#   ~1.5-2x decode). GLM+Kimi captured fine on these 8 nodes, so likely OK.
+# - vLLM #46042 ROOT-CAUSED + FIXED HERE (2026-07-22): the streaming
+#   <mm:think> leak is the parser's prompt gate — is_reasoning_end(prompt)
+#   marker-scans the prompt, and EVERY M3 prompt contains both markers
+#   (literal text in the template's <thinking_instructions>; preserved
+#   think blocks in multi-turn history) -> "reasoning already ended" ->
+#   whole stream passes through as raw content. Non-streaming unaffected.
+#   Fixed by mods/minimax-m3-reasoning-stream (prompt gate -> False;
+#   replay-verified single-turn/multi-turn/no-think). Unreported upstream
+#   as of 07-22.
+
+recipe_version: "1"
+name: MiniMax-M3-NVFP4
+description: vLLM serving nvidia/MiniMax-M3-NVFP4 (NVFP4, vision) on 4x DGX Spark, TP=4
+
+model: nvidia/MiniMax-M3-NVFP4
+container: vllm-node
+cluster_only: true
+
+mods:
+  - mods/minimax-m3-swigluoai
+  - mods/minimax-m3-reasoning-stream
+  - mods/minimax-m3-topk-buffer-layout
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  # 0.88 + the 34.5GiB fp8 KV pool below = 1M native context. Validated
+  # 2026-07-22: needle 3/3 at 112k / 536k / 1,004k tokens (temp 0,
+  # verbatim answers), canary exact, engine clean after the full-1M
+  # request (~25 min wall: ~3 min tokenize + ~20 min prefill).
+  gpu_memory_utilization: 0.88
+  max_model_len: 1048576
+  # 128 REQUIRED: MiniMax M3 sparse attention (MSA) uses PAGE_SIZE=128.
+  # Must pair with --attention-backend TRITON_ATTN: the auto-picked
+  # FLASHINFER full-attn backend only advertises block 128 when the
+  # trtllm-gen large-pages kernel is usable, which it is NOT on sm_121
+  # (use_large_pages=False) -> "No common block size for 128". TRITON_ATTN
+  # supports MultipleOf(16) so it accepts 128 and reconciles with MSA.
+  block_size: 128
+  # Concurrency is SAFE again (2026-07-22, evening): the "any concurrency
+  # kills the engine" crash was ROOT-CAUSED to the topk_indices_buffer
+  # layout mismatch (token-major allocation vs head-major Triton
+  # consumers -> NULL data_ptr on mixed decode+prefill batches) and is
+  # fixed by mods/minimax-m3-topk-buffer-layout (full analysis in that
+  # mod's header; coredump-verified, 20/20 scenario matrix + 8-min 4-way
+  # soak clean). If a future image bump regresses concurrency, check
+  # that mod's anchors FIRST.
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+
+env:
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  # SWITCH FABRIC (2026-07-22): quartet on the 100G QSFP switch, flat
+  # 192.168.100.0/24 — NCCL runs real RDMA (RoCEv2, dual rail). The
+  # launcher injects NCCL_IB_HCA / NCCL_SOCKET_IFNAME / NCCL_IB_DISABLE=0
+  # docker-level on every node from .env (IB_IF=rocep1s0f0,roceP2p1s0f0,
+  # ETH_IF=enp1s0f0np0). The ring-era TCP workarounds that lived here
+  # (NCCL_IB_DISABLE=1 + socket steering) are gone — do not resurrect.
+  # Conservative NCCL transport pins below adopted from the working
+  # 8x-Spark TP=8 deployments (same set as glm-5.2 recipe; eugr #260).
+  # Candidates to relax when tuning.
+  NCCL_PROTO: Simple
+  NCCL_ALGO: Ring
+  NCCL_NCHANNELS: "1"
+  NCCL_CROSS_NIC: "0"
+  NCCL_IB_QPS_PER_CONNECTION: "1"
+  NCCL_IB_TIMEOUT: "25"
+  NCCL_IB_RETRY_CNT: "7"
+  NCCL_IB_ROCE_VERSION_NUM: "2"
+  NCCL_IB_ADDR_FAMILY: AF_INET
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1200"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  MALLOC_ARENA_MAX: "2"
+  NCCL_NVLS_ENABLE: "0"
+
+command: |
+  vllm serve nvidia/MiniMax-M3-NVFP4 \
+  --served-model-name MiniMax-M3-NVFP4 \
+  --host {host} \
+  --port {port} \
+  --trust-remote-code \
+  --tensor-parallel-size {tensor_parallel} \
+  --block-size {block_size} \
+  --attention-backend TRITON_ATTN \
+  --max-model-len {max_model_len} \
+  --max-num-seqs {max_num_seqs} \
+  --max-num-batched-tokens {max_num_batched_tokens} \
+  --gpu-memory-utilization {gpu_memory_utilization} \
+  --kv-cache-dtype fp8 \
+  --kv-cache-memory-bytes 37044092928 \
+  --generation-config auto \
+  --speculative-config '{{"method": "eagle3", "model": "Inferact/MiniMax-M3-EAGLE3", "num_speculative_tokens": 2, "attention_backend": "TRITON_ATTN"}}' \
+  --limit-mm-per-prompt '{{"image": 8}}' \
+  --mm-encoder-tp-mode data \
+  --enable-prefix-caching \
+  --distributed-executor-backend ray \
+  --enable-auto-tool-choice \
+  --tool-call-parser minimax_m3 \
+  --reasoning-parser minimax_m3 \
+  --load-format instanttensor
