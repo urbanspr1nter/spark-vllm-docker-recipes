@@ -71,6 +71,24 @@
 # Measured: 27.3 -> ~34 tok/s single-stream (66% token acceptance,
 # 1.32 accepted/draft). KV pool 710,784 -> 601,984 (draft layer's slice).
 #
+# MULTI-IMAGE (2026-07-23, hunt CLOSED): --mm-encoder-tp-mode data
+# REMOVED (back to default replicated 'weights') — in data mode EVERY
+# image after the first arrived as zeroed features (real bug, silent;
+# file upstream). After removal, multi-image is VALIDATED for real
+# content: 4 text-bearing images at mixed sizes 64-448px, all positions,
+# all read correctly. The residual "failures" during the hunt were a
+# MODEL-level quirk, not infra: byte-uniform single-color swatches in
+# positions >=2 sometimes read as "black/gray" — instrumentation proved
+# the vision tower emits HEALTHY embeddings for them (norm ~256, no
+# NaNs) while the model still answers "black"; one pixel of texture
+# restores perfect binding. Ruled out along the way: fp8 KV (bf16
+# identical), caches (fresh images fail too), feature placement (mixed
+# sizes/positions bind fine with real content). Note: preprocessor
+# resizes 48px and 64px inputs to IDENTICAL tensors (grid 4x4) — byte-
+# different client images can collide in content-hash caches by design.
+# Image limit raised 8 -> 64 (per-prompt = whole conversation incl.
+# history for chat clients).
+#
 # 1M CONTEXT via FP8 KV (2026-07-22, late): --kv-cache-dtype fp8 halves
 # per-token KV -> 34.5GiB pool = 1,087,872 tokens >= native 1,048,576.
 # Notes from the bring-up:
@@ -202,8 +220,7 @@ command: |
   --kv-cache-memory-bytes 37044092928 \
   --generation-config auto \
   --speculative-config '{{"method": "eagle3", "model": "Inferact/MiniMax-M3-EAGLE3", "num_speculative_tokens": 2, "attention_backend": "TRITON_ATTN"}}' \
-  --limit-mm-per-prompt '{{"image": 8}}' \
-  --mm-encoder-tp-mode data \
+  --limit-mm-per-prompt '{{"image": 64}}' \
   --enable-prefix-caching \
   --distributed-executor-backend ray \
   --enable-auto-tool-choice \
