@@ -11,5 +11,4 @@ BASE_PATH="$HOME/code/spark-vllm-docker"
     --ib-if rocep1s0f0 \
     --eth-if enp1s0f0np0 \
     --earlyoom --earlyoom-args "-M 2097152,524288 -s 100 -r 60" \
-    --gpu-memory-utilization 0.82 \
     -n $HOST_1,$HOST_2,$HOST_3,$HOST_4
