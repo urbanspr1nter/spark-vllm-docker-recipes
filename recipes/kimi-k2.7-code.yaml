@@ -1,0 +1,109 @@
+# Recipe: Kimi-K2.7-Code
+# moonshotai/Kimi-K2.7-Code: ~1T-param MoE (384 experts, 61 layers, 32B
+# active), MULTIMODAL (vision, KimiK25ForConditionalGeneration), native
+# INT4 QAT weights (compressed-tensors -> marlin path on sm_121; the INT4
+# IS the reference weights, not a lossy afterquant). ~555GiB -> ~69GiB/node
+# on 8 Sparks at TP=8 (64 heads and 384 experts divide cleanly).
+#
+# Unlike GLM-5.2 this model has NO DSA sparse attention, so:
+# - mods/sparse-mla-chunked is NOT needed (no sparse-MLA kernels involved)
+# - the persistent_topk 400K ceiling does not apply; native 262144 works
+# - mods/glm-5.2 IS included: same DeepSeek MLA geometry (kv_lora 512 +
+#   rope 64 = 576), so the Triton decode kernel's sm_121 shared-memory
+#   fix applies if that backend is selected.
+#
+# Vision: --limit-mm-per-prompt raises the default 1-image cap; UI-trace
+# workflows send several screenshots per request. --mm-encoder-tp-mode data
+# runs the small MoonViT encoder per-rank instead of TP'd across 8 nodes
+# over RoCE (per the official vLLM recipe; big latency win on multinode).
+#
+# SAMPLING (critical): --generation-config auto makes vLLM honor the
+# model's generation_config.json (temperature 1.0, top_p 0.95). Without
+# it, clients that send NO sampling params (e.g. pi) run at top_p=1.0 and
+# long repetitive contexts collapse into runaway repetition ("count to
+# infinity"). Confirmed by replaying a captured 70K pi context: paramless
+# = runaway, top_p=0.95 = clean. jan.ai was fine only because it sends
+# its own sampling. This is the real fix for the pi degeneration; the
+# reasoning-field/thinkingFormat rabbit hole was a red herring.
+#
+# MULTI-TURN CLIENTS: K2.7-Code is thinking-only with preserve_thinking
+# forced on — it EXPECTS prior-turn reasoning kept in history. Clients
+# that strip reasoning from context (most agents' default) push it
+# off-distribution and long sessions degrade into repetition loops.
+# Configure agents to pass reasoning back. Recommended sampling:
+# temperature=1.0, top_p=0.95 (official).
+#
+# No native MTP (num_nextn_predict_layers=0). DFlash speculation TESTED
+# AND REJECTED (2026-07-05): the community draft cm00cm/Kimi-K2.7-Code-
+# DFlash got 9.7% acceptance against this INT4 deployment — decode fell
+# 22.75 -> 10.2 tok/s — and outputs shifted at temperature 0 (one canary
+# + one vision check regressed), so this dflash path is not strictly
+# lossless here. Drafts don't transfer across quants/configs; revisit
+# only with a draft trained against this exact deployment.
+#
+# HOST MEMORY (2026-07-12 incident): at gpu_memory_utilization 0.85 the
+# head node froze in a kernel OOM (swap exhausted, fleet power-cycled)
+# when a multimodal request's host-side image processing + the MM
+# processor cache (~5.5GB shmem at death) + desktop apps landed on top
+# of the ~104GB GPU reservation in unified memory. NVRM NV_ERR_NO_MEMORY
+# warnings appeared from warmup onward — that's the early signal.
+# Mitigations: 0.85 -> 0.82 (~3.7GB host headroom back per node; KV pool
+# still >2x the context window) and --mm-processor-cache-gb 2 (repeat-
+# image cache; total usage is cache_gb * (api_server_count + dp_size)).
+# Also avoid heavy desktop apps on spark-01 while this model serves.
+
+recipe_version: "1"
+name: Kimi-K2.7-Code
+description: vLLM serving moonshotai/Kimi-K2.7-Code (INT4, vision) on 8x DGX Spark, TP=8
+
+model: moonshotai/Kimi-K2.7-Code
+container: vllm-node
+cluster_only: true
+
+mods:
+  - mods/glm-5.2
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 8
+  gpu_memory_utilization: 0.82
+  max_model_len: 262144
+  block_size: 64
+  max_num_seqs: 4
+  max_num_batched_tokens: 2048
+
+env:
+  # FlashInfer sampler kernel race on SM120/121 — keep torch-native sampler
+  # until flashinfer#3615-era fixes are confirmed in the shipped wheel.
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  # ~555GiB of weights: generous engine timeout for load/warmup
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1200"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  MALLOC_ARENA_MAX: "2"
+  NCCL_NVLS_ENABLE: "0"
+
+command: |
+  vllm serve moonshotai/Kimi-K2.7-Code \
+  --served-model-name Kimi-K2.7-Code \
+  --host {host} \
+  --port {port} \
+  --trust-remote-code \
+  --tensor-parallel-size {tensor_parallel} \
+  --kv-cache-dtype fp8 \
+  --block-size {block_size} \
+  --max-model-len {max_model_len} \
+  --max-num-seqs {max_num_seqs} \
+  --max-num-batched-tokens {max_num_batched_tokens} \
+  --gpu-memory-utilization {gpu_memory_utilization} \
+  --limit-mm-per-prompt '{{"image": 64}}' \
+  --mm-processor-cache-gb 2 \
+  --mm-encoder-tp-mode data \
+  --enable-prefix-caching \
+  --distributed-executor-backend ray \
+  --enable-auto-tool-choice \
+  --tool-call-parser kimi_k2 \
+  --reasoning-parser kimi_k2 \
+  --generation-config auto \
+  --load-format instanttensor

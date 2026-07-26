@@ -16,6 +16,17 @@
 # context). The pattern matches the config's indexer_types: 21 "full" +
 # 57 "shared" over 78 layers.
 #
+# REQUIRED since the dev1479 wheel: --attention-config sparse_mla_force_mqa.
+# The attention refactor routes "pure prefill" batches whose seq len fits
+# within topk_tokens (<=2048) into impl.forward_mha, which the SM120 sparse
+# MLA backend leaves as a NotImplementedError stub (backend.py) — the router
+# never checks for support. Any multi-chunk prefill (i.e. every real prompt)
+# kills the EngineCore (worker NotImplementedError -> scheduler KeyError ->
+# EngineDeadError). Forcing MQA keeps all prefill on the dsv3_2 path that
+# mods/sparse-mla-chunked feeds, i.e. the pre-refactor behavior. Remove when
+# upstream makes the MHA route capability-checked (candidate upstream fix:
+# gate use_mha on the backend actually implementing forward_mha).
+#
 # Model supports 1M context. 400000 is the hardware ceiling on GB10:
 # vLLM's persistent_topk kernel (DSA indexer) runs as a cooperative CTA
 # group sized ~1 CTA per ~8350 columns, capped at 48 co-resident CTAs on
@@ -98,7 +109,12 @@ defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 8
-  gpu_memory_utilization: 0.85
+  # 0.82 since the dev1479 wheel: its memory profiler accounts CUDA-graph
+  # memory and sizes the KV pool larger, leaving the head node ~3GB of host
+  # slack at 0.85 (99x NVRM NV_ERR_NO_MEMORY during boot warmup, first
+  # request OOM-crashed the engine fleet-wide). Same relief valve as the
+  # Kimi head-node OOM. Healthy gate: zero NVRM errors through boot+canary.
+  gpu_memory_utilization: 0.82
   max_model_len: 400000
   block_size: 64
   max_num_seqs: 4
@@ -156,6 +172,7 @@ command: |
   --max-num-batched-tokens {max_num_batched_tokens} \
   --gpu-memory-utilization {gpu_memory_utilization} \
   --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
+  --attention-config '{{"sparse_mla_force_mqa": true}}' \
 
   --hf-overrides '{{"index_topk_pattern": "FFFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSS"}}' \
   --enable-prefix-caching \
