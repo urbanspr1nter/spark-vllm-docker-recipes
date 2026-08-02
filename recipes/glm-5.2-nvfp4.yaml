@@ -63,8 +63,6 @@
 # - GSM8K on this exact config (MTP2): 92.7% strict, full 1319 problems.
 #   Baseline without MTP measured 93.1% — within run-to-run noise (+/-0.7%),
 #   confirming speculative decoding is lossless under greedy.
-# - At 332K context: decode 20.4 tok/s, 5-fact synthesis across 10-90%
-#   depth exact, prefill ~635 tok/s.
 # - MoE backend: auto (FLASHINFER_CUTLASS main + triton for the BF16 MTP
 #   draft layer). Do NOT set --moe-backend marlin with MTP: the draft MoE
 #   is unquantized and marlin rejects it. Note upstream vLLM #46834 (MTP
@@ -75,9 +73,6 @@
 # - flashinfer_b12x MoE (mods/b12x-min): works but no win (12.6 tok/s);
 #   decode is all-reduce-latency-bound so MoE kernels barely matter.
 # Operational notes:
-# - Never run two launcher invocations concurrently: a still-running
-#   launch-cluster.sh execs a second vllm serve into new containers
-#   (EADDRINUSE on the master port, phantom crashes).
 # - If launches hang silently in distributed init right after "Model
 #   loading took", clear ~/.cache/vllm/torch_compile_cache and
 #   flashinfer_autotune_cache on ALL nodes (a hard-crashed launch can
@@ -103,6 +98,14 @@ cluster_only: true
 mods:
   - mods/glm-5.2
   - mods/sparse-mla-chunked
+  # vLLM #46074: indexer buffer off-by-one with MTP at block-aligned
+  # max_model_len (400000/64=6250 exactly — we sit on the trigger)
+  - mods/glm-indexer-mtp-overhang
+  # REQUIRED for >400K: lifts the persistent_topk 48-CTA ceiling. Must be
+  # paired with CONTAINER_VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=256 in .env,
+  # which caps the indexer transient that froze nodes at 430K on 2026-07-20.
+  # Both validated together 2026-08-01 at 480K, multi-depth needles exact.
+  - mods/glm-topk-per-row
 
 # Default settings (can be overridden via CLI where supported)
 defaults:
@@ -115,7 +118,7 @@ defaults:
   # request OOM-crashed the engine fleet-wide). Same relief valve as the
   # Kimi head-node OOM. Healthy gate: zero NVRM errors through boot+canary.
   gpu_memory_utilization: 0.82
-  max_model_len: 400000
+  max_model_len: 600000
   block_size: 64
   max_num_seqs: 4
   # 2048 requires mods/sparse-mla-chunked (chunks attention calls into
@@ -173,7 +176,6 @@ command: |
   --gpu-memory-utilization {gpu_memory_utilization} \
   --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
   --attention-config '{{"sparse_mla_force_mqa": true}}' \
-
   --hf-overrides '{{"index_topk_pattern": "FFFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSS"}}' \
   --enable-prefix-caching \
   --distributed-executor-backend ray \
