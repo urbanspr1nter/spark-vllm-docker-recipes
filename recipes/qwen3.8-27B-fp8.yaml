@@ -1,0 +1,48 @@
+# Recipe: Qwen3.8-27B-FP8
+# Qwen3.8-27B model in FP8 format
+
+recipe_version: "1"
+name: Qwen3.8-27B-FP8
+description: vLLM serving Qwen/Qwen3.8-27B-FP8
+
+# HuggingFace model to download (optional, for --download-model)
+model: Qwen/Qwen3.8-27B-FP8
+
+# Container image to use
+container: vllm-node
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+  max_num_seqs: 32
+  max_num_batched_tokens: 8192
+
+# Environment variables
+env: {}
+
+# The vLLM serve command template
+command: |
+  vllm serve Qwen/Qwen3.8-27B-FP8 \
+    --served-model-name Qwen3.8-27B \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    --attention-backend flashinfer \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":3}}' \
+    --load-format fastsafetensors \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder \
+    --enable-auto-tool-choice
